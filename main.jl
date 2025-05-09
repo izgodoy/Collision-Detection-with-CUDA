@@ -17,6 +17,7 @@ end
 begin
 	using Base.Threads
 	using Distributed
+	using Flatten
 end
 
 # ╔═╡ eb3c03f6-b86d-4371-ad7a-6b49fd96d403
@@ -138,13 +139,16 @@ begin
 	        end
 	    end
 
+		unique_neighbors = unique(neighbors)
+
 		# if the object has fewer than 2^d neighboring cells, the extra cell IDs
 		# are marked as 0xffffffff to indicate they are not valid
-		while length(neighbors) < 2^d
-			push!(neighbors, 0xffffffff)
-		end
+		padded_neighbors = vcat(
+            unique_neighbors[1:min(end, 2^d)],
+            fill(0xffffffff, max(0, 2^d - length(unique_neighbors)))
+        )
 	
-	    return unique(neighbors)
+	    return padded_neighbors
 	end
 
 	# test with the same example sphere from above	
@@ -162,16 +166,25 @@ Here, we take advantage of native Julia parallelization by calling `@threads`.
 function construct_cellIDs(positions::Vector{<:AbstractVector{<:Real}},
                          radii::Vector{<:Real},
                          cellsize::Real)
+	d = length(positions[1])
     n = length(positions)
-    cellID_arr = Vector{Vector{UInt32}}(undef, n)  # contains overlapping cell IDs 													   # for each object
+    cellID_arr = Array{UInt32}(undef, n * 2^d)
+	objID_arr = Array{Int32}(undef, n)
 
     @threads for i in 1:n
         pos = positions[i]
         radius = radii[i]
-        cellID_arr[i] = neighboring_hashes(pos, radius, cellsize)
+        neighbors = neighboring_hashes(pos, radius, cellsize)
+
+        offset = (i - 1) * 2^d
+        for j in 1:2^d
+            idx = offset + j
+            cellID_arr[idx] = neighbors[j]
+        end
+        objID_arr[i] = i
     end
 
-    return cellID_arr
+    return cellID_arr, objID_arr
 end
 
 # ╔═╡ 3751925f-e7c3-4763-9ddf-622f5d139c27
@@ -180,7 +193,9 @@ begin
 	positions = [Vector(rand(3) * 10) for _ in 1:100_000]
 	radii = rand(0.5:0.1:1.0, 100_000)
 
-	cellID_arr = construct_cellIDs(positions, radii, cellsize)
+	cellID_arr, objID_arr = construct_cellIDs(positions, radii, cellsize)
+	println("First object's entries from cell ID array: ", cellID_arr[1:min(8,end)])
+	println("First 5 Object ID Array entries: ", objID_arr[1:min(5,end)])
 end
 
 # ╔═╡ b538ef69-8306-4d77-a58f-d7915113bb03
@@ -219,6 +234,36 @@ function generate_cell_ids_kernel(positions, radii, cell_ids, counts, cellsize)
     return
 end
 
+# ╔═╡ a014f305-95d0-4331-8539-2f871de2dcac
+md"""
+### Single-Block Sum Kernel
+"""
+
+# ╔═╡ 2f60a5fd-8685-433a-b8c5-bebcbc741996
+function count_per_block_kernel(counts, counts_per_block)
+	shared = @cuStaticSharedMem(Int32, 256)  # Assumes block size = 256
+    tid = threadIdx().x
+    bid = blockIdx().x
+    idx = (bid - 1) * blockDim().x + tid
+
+    # use shared memory for block reduction
+    shared[tid] = (idx <= length(counts)) ? counts[idx] : 0
+    sync_threads()
+
+    stride = blockDim().x ÷ 2
+    while stride ≥ 1
+        if tid ≤ stride && tid + stride ≤ blockDim().x
+            local_counts[tid] += local_counts[tid + stride]
+        end
+        sync_threads()
+        stride ÷= 2
+    end
+
+    if tid == 1
+        counts_per_block[bid] = local_counts[1]
+    end
+end
+
 # ╔═╡ 26075747-9adf-4a53-ad42-8b349a32d871
 md"""
 ### A CPU-Fallback Prefix Sum
@@ -240,49 +285,23 @@ md"""
 ### Launching From Host
 """
 
-# ╔═╡ a014f305-95d0-4331-8539-2f871de2dcac
-md"""
-### Single-Block Sum Kernel
-"""
-
-# ╔═╡ 2f60a5fd-8685-433a-b8c5-bebcbc741996
-function count_per_block_kernel(counts, counts_per_block)
-    tid = threadIdx().x
-    bid = blockIdx().x
-    idx = (bid - 1) * blockDim().x + tid
-
-    # use shared memory for block reduction
-    @shared local_counts::Vector{Int32}
-    local_counts[tid] = (idx <= length(counts)) ? counts[idx] : 0
-    sync_threads()
-
-    stride = blockDim().x ÷ 2
-    while stride ≥ 1
-        if tid ≤ stride && tid + stride ≤ blockDim().x
-            local_counts[tid] += local_counts[tid + stride]
-        end
-        sync_threads()
-        stride ÷= 2
-    end
-
-    if tid == 1
-        counts_per_block[bid] = local_counts[1]
-    end
-end
-
 # ╔═╡ 0c825de6-0ef3-4fdd-8265-2e13c323b370
-function host_counting(positions, radii, cellsize)
+function host_counting(positions::Vector, radii::Vector, cellsize::Real)
+	d = length(positions[1])
 	num_threads = 256
 	num_blocks = cld(length(positions), num_threads)
 	
 	# allocate on GPU
-	cell_ids = CUDA.zeros(UInt32, max_possible_ids)
+	cell_ids = CUDA.zeros(UInt32, 2^d)
 	counts = CUDA.zeros(Int32, length(positions))
 	counts_per_block = CUDA.zeros(Int32, num_blocks)
 	
 	# launch first kernel
+	positions_gpu = CuVector(positions)
+	radii_gpu = CuVector(radii)
+
 	@cuda threads=num_threads blocks=num_blocks generate_cell_ids_kernel(
-	    positions, radii, cell_ids, counts, cellsize
+	    positions_gpu, radii_gpu, cell_ids, counts, cellsize
 	)
 
 	# precompute prefix sum
@@ -294,6 +313,12 @@ function host_counting(positions, radii, cellsize)
 	)
 end
 
+# ╔═╡ 781785ab-f248-4750-a78d-e02e032d969b
+begin
+	# testing parallelized counting
+	host_counting(positions, radii, cellsize)
+end
+
 # ╔═╡ 9f17e760-118f-48d3-8da9-a70dd4d09081
 md"""
 ## Sorting the Cell ID Array
@@ -302,7 +327,7 @@ We want elements with the same cell ID to be sorted by cell ID type (H before P)
 
 A basic radix sort works by sorting B-bit keys by groups of L bits within them in successive passes. For our purposes, we will sort 32-bit cell IDs. If, for example, we choose to separate them into 8-bit groups, we’ll make four passes. A radix sort happens to sort low-order bits before higher-order bits, which is exactly what we need for our implementation.
 
-"Each sorting pass of a radix sort proceeds masks off all the bits of each key except for the currently active set of L bits, and then it tabulates the number of occurrences of each of the 2^L possible values that result from this masking. The resulting array of radix counters is then processed to convert each value into offsets from the beginning of the array. In other words, each value of the table is replaced by the sum of all its preceding values; this operation is called a prefix sum. Finally, these offsets are used to determine the new positions of the keys for this pass, and the array of keys is reordered accordingly." (NVIDIA Docs)
+"Each sorting pass of a radix sort...masks off all the bits of each key except for the currently active set of L bits, and then it tabulates the number of occurrences of each of the 2^L possible values that result from this masking. The resulting array of radix counters is then processed to convert each value into offsets from the beginning of the array. In other words, each value of the table is replaced by the sum of all its preceding values; this operation is called a prefix sum. Finally, these offsets are used to determine the new positions of the keys for this pass, and the array of keys is reordered accordingly." (NVIDIA Docs)
 """
 
 # ╔═╡ 12a15f7b-bc23-4809-b360-bef010b67857
@@ -312,7 +337,124 @@ md"""
 """
 
 # ╔═╡ ef58c4b1-73b4-457a-ac2d-4d25a4fd3eb3
+function encode_keys_kernel!(
+    keys::CuDeviceVector{UInt64},
+    cell_ids::CuDeviceVector{UInt32},
+    k::Int  # number of cell IDs per object = 2^d
+	)
+	
+    idx = threadIdx().x + (blockIdx().x - 1) * blockDim().x
+    if idx > length(cell_ids)
+        return
+    end
 
+    offset_in_object = (idx - 1) % k
+    type_bit = offset_in_object == 0 ? UInt64(0) : UInt64(1)
+
+    keys[idx] = UInt64(cell_ids[idx]) << 1 | type_bit
+
+	return nothing
+end
+
+# ╔═╡ c7efa378-5754-4e94-85bb-ee4cae125c3f
+function flags_kernel!(flags, keys_in, bit, n)
+    i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    if i <= n
+        flags[i] = (keys_in[i] >> bit) & 1
+    end
+end
+
+# ╔═╡ be4bc9d9-5188-4f2f-a72a-89a216d65531
+function scatter_kernel!(flags, scanned, total_zeros, keys_in, vals_in, keys_out, vals_out, n)
+    i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    if i <= n
+        flag = flags[i]
+        pos = flag == 0 ? (i - scanned[i]) : (total_zeros + scanned[i] - 1)
+
+        keys_out[pos + 1] = keys_in[i]
+        vals_out[pos + 1] = vals_in[i]
+    end
+end
+
+# ╔═╡ b9e300e9-68c0-4a0d-a98a-c5b87c0bbc05
+function radix_sort_pass!(
+    keys_in::CuDeviceVector{UInt64},
+    vals_in::CuDeviceVector{Int32},
+    keys_out::CuDeviceVector{UInt64},
+    vals_out::CuDeviceVector{Int32},
+    bit::Int
+)
+    n = length(keys_in)
+
+    # compute bit flags (0 or 1)
+    flags = CUDA.zeros(Int32, n)
+	@cuda threads=256 blocks=cld(n, 256) flags_kernel!(flags, keys_in, bit, n)
+
+    # inclusive scan (prefix sum of flags)
+    scanned = CUDA.zeros(Int32, n)
+    CUDA.prefixsum!(scanned, flags)
+
+    # total number of zeros = n - scanned[end]
+    total_ones = scanned[end]
+    total_zeros = n - total_ones
+
+    # scatter based on bit
+    flags = CUDA.zeros(Int32, n)
+	scanned = CUDA.zeros(Int32, n)
+	total_zeros = n - total_ones
+	
+	# Launch the kernel
+	@cuda threads=256 blocks=cld(n, 256) scatter_kernel!(flags, scanned, total_zeros, keys_in, vals_in, keys_out, vals_out, n)
+
+    return nothing # free extra memory
+end
+
+# ╔═╡ 789800e9-91ca-4bc7-af7b-9fdaeac06d02
+function full_radix_sort!(keys::CuDeviceVector{UInt64}, vals::CuDeviceVector{Int32})
+    nbits = 64
+    tmp_keys = similar(keys)
+    tmp_vals = similar(vals)
+
+    from_keys = keys
+    from_vals = vals
+    to_keys = tmp_keys
+    to_vals = tmp_vals
+
+    for bit in 0:nbits-1
+        radix_sort_pass!(from_keys, from_vals, to_keys, to_vals, bit)
+        from_keys, to_keys = to_keys, from_keys
+        from_vals, to_vals = to_vals, from_vals
+    end
+
+    if from_keys != keys
+        copyto!(keys, from_keys)
+        copyto!(vals, from_vals)
+    end
+end
+
+# ╔═╡ 0bf81009-8d6d-4acf-8944-5232a299d624
+function host_radix_kernel(
+	d::Int,
+	cellIDs::Vector{UInt32},
+	objectIDs::Vector{Int32}
+)
+	k = 2^d
+	n = length(cellID_arr) ÷ k
+	keys = CUDA.zeros(UInt64, n * k)
+
+	cellID_arr_gpu = CuArray(cellIDs)
+	objID_arr_gpu = CuArray(objectIDs)
+	
+	@cuda threads=256 blocks=cld(n * k, 256) encode_keys_kernel!(keys, cellID_arr_gpu, k)
+
+	full_radix_sort!(keys, objID_arr_gpu)
+end
+
+# ╔═╡ 97f35301-8731-4836-a283-3e625c89323e
+begin
+	#test above functionality
+	host_radix_kernel(3, cellID_arr, objID_arr)
+end
 
 # ╔═╡ 88c25cc9-c055-433e-aaba-5c9e1d2c75df
 md"""
@@ -329,10 +471,12 @@ PLUTO_PROJECT_TOML_CONTENTS = """
 [deps]
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
+Flatten = "4c728ea3-d9ee-5c9a-9642-b6f7d7dc04fa"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 
 [compat]
 CUDA = "~5.7.3"
+Flatten = "~0.4.3"
 """
 
 # ╔═╡ 00000000-0000-0000-0000-000000000002
@@ -341,7 +485,7 @@ PLUTO_MANIFEST_TOML_CONTENTS = """
 
 julia_version = "1.11.5"
 manifest_format = "2.0"
-project_hash = "8c123764fe90c7c581d716e8f0c986ddce033460"
+project_hash = "b2f779d77b0ef63d192259779616c96e44c55295"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -476,6 +620,21 @@ deps = ["Artifacts", "Libdl"]
 uuid = "e66e0078-7015-5450-92f7-15fbd957f2ae"
 version = "1.1.1+0"
 
+[[deps.ConstructionBase]]
+git-tree-sha1 = "76219f1ed5771adbb096743bff43fb5fdd4c1157"
+uuid = "187b0558-2788-49d3-abe0-74a17ed4e7c9"
+version = "1.5.8"
+
+    [deps.ConstructionBase.extensions]
+    ConstructionBaseIntervalSetsExt = "IntervalSets"
+    ConstructionBaseLinearAlgebraExt = "LinearAlgebra"
+    ConstructionBaseStaticArraysExt = "StaticArrays"
+
+    [deps.ConstructionBase.weakdeps]
+    IntervalSets = "8197267c-284f-5f27-9208-e0e47529a953"
+    LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+    StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+
 [[deps.Crayons]]
 git-tree-sha1 = "249fe38abf76d48563e2f4556bebd215aa317e15"
 uuid = "a8cc5b0e-0ffa-5ad4-8c14-923d3ee1735f"
@@ -523,6 +682,11 @@ git-tree-sha1 = "27415f162e6028e81c72b82ef756bf321213b6ec"
 uuid = "e2ba6199-217a-4e67-a87a-7c52f15ade04"
 version = "0.1.10"
 
+[[deps.FieldMetadata]]
+git-tree-sha1 = "c279c6eab9767a3f62685e5276c850512e0a1afd"
+uuid = "bf96fef3-21d2-5d20-8afa-0e7d4c32a885"
+version = "0.3.1"
+
 [[deps.FileWatching]]
 uuid = "7b1f6079-737a-58dc-b8bc-7a2ca5c1b5ee"
 version = "1.11.0"
@@ -532,6 +696,12 @@ deps = ["Statistics"]
 git-tree-sha1 = "05882d6995ae5c12bb5f36dd2ed3f61c98cbb172"
 uuid = "53c48c17-4a7d-5ca2-90c5-79b7896eea93"
 version = "0.8.5"
+
+[[deps.Flatten]]
+deps = ["ConstructionBase", "FieldMetadata"]
+git-tree-sha1 = "d3541c658c7e452fefba6c933c43842282cdfd3e"
+uuid = "4c728ea3-d9ee-5c9a-9642-b6f7d7dc04fa"
+version = "0.4.3"
 
 [[deps.Future]]
 deps = ["Random"]
@@ -994,9 +1164,16 @@ version = "17.4.0+2"
 # ╠═73df3e31-3893-4f93-85a5-7a3c95f84d69
 # ╟─0a63b76f-f45d-4a27-bbe8-64edb177f7d9
 # ╠═0c825de6-0ef3-4fdd-8265-2e13c323b370
+# ╠═781785ab-f248-4750-a78d-e02e032d969b
 # ╟─9f17e760-118f-48d3-8da9-a70dd4d09081
 # ╟─12a15f7b-bc23-4809-b360-bef010b67857
 # ╠═ef58c4b1-73b4-457a-ac2d-4d25a4fd3eb3
+# ╠═b9e300e9-68c0-4a0d-a98a-c5b87c0bbc05
+# ╠═c7efa378-5754-4e94-85bb-ee4cae125c3f
+# ╠═be4bc9d9-5188-4f2f-a72a-89a216d65531
+# ╠═789800e9-91ca-4bc7-af7b-9fdaeac06d02
+# ╠═0bf81009-8d6d-4acf-8944-5232a299d624
+# ╠═97f35301-8731-4836-a283-3e625c89323e
 # ╟─88c25cc9-c055-433e-aaba-5c9e1d2c75df
 # ╟─00000000-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000002
